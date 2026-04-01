@@ -26,11 +26,15 @@ TILE_COLORS = [
 SHADOW_BASE = (12, 12, 22)
 TEXT_COLOR = (205, 200, 212)
 TEXT_DIM = (95, 90, 108)
-ARROW_ALPHA = 28
 FLASH_COLOR = (255, 255, 255)
 BUTTON_IDLE = (52, 48, 68)
 BUTTON_HOVER = (72, 66, 92)
 WIN_TEXT_COLOR = (255, 222, 160)
+
+# Arrow visuals
+ARROW_STATIC_ALPHA = 28       # pre-shown arrows
+ARROW_DISCOVERED_ALPHA = 22   # arrows revealed by clicking
+ARROW_DISCOVERED_COLOR = (180, 220, 255)  # slightly blue tint for discovered
 
 # Tile geometry
 TILE_RADIUS = 14
@@ -50,6 +54,11 @@ WIN_PULSE_SPEED = 1.4
 WIN_PULSE_SCALE = 0.025
 WIN_PULSE_BRIGHT = 18
 WIN_FADE_IN = 0.4
+
+# Discovery modes
+DISC_VISIBLE = 'visible'      # all arrows shown from the start
+DISC_DISCOVER = 'discover'    # arrows hidden until you click, then persist
+DISC_MEMORY = 'memory'        # flash only, nothing persists
 
 # ========================= EASING =========================
 
@@ -132,7 +141,6 @@ class Tile:
         return lerp_color(TILE_COLORS[self.prev_color], TILE_COLORS[self.color], t)
 
     def _scale(self, now):
-        # Pop animation
         pop = 1.0
         if self.pop_t0 >= 0 and now >= self.pop_t0:
             t = clamp01((now - self.pop_t0) / POP_DUR)
@@ -146,7 +154,6 @@ class Tile:
                     s = ease_out_cubic((t - 0.35) / 0.65)
                     pop = POP_PEAK - (POP_PEAK - 1.0) * s
 
-        # Idle breathing
         breath = 1.0 + IDLE_BREATH_AMP * math.sin(now * IDLE_BREATH_SPEED * math.tau + self.breath_phase)
         return pop * breath
 
@@ -177,7 +184,7 @@ class Tile:
         tile_rect = pygame.Rect(rx, ry, sz, sz)
         pygame.draw.rect(surf, color, tile_rect, border_radius=TILE_RADIUS)
 
-        # Inner highlight — soft lighter strip at top
+        # Inner highlight
         hl_color = brighten(color, 22)
         hl_w = sz - 10
         hl_h = max(1, sz // 4)
@@ -188,75 +195,165 @@ class Tile:
                              border_radius=TILE_RADIUS - 3)
             surf.blit(hl_surf, (rx + 5, ry + 3))
 
-# ========================= LEVELS =========================
+# ========================= ADJACENCY =========================
 
-def make_adjacency(rows, cols, pattern):
-    adj = {(r, c): [] for r in range(rows) for c in range(cols)}
-    if pattern == 'right':
-        for r in range(rows):
-            for c in range(cols - 1):
-                adj[(r, c)].append((r, c + 1))
-    elif pattern == 'down':
-        for r in range(rows - 1):
-            for c in range(cols):
-                adj[(r, c)].append((r + 1, c))
-    elif pattern == 'right_down':
-        for r in range(rows):
-            for c in range(cols):
-                if c + 1 < cols:
-                    adj[(r, c)].append((r, c + 1))
-                if r + 1 < rows:
-                    adj[(r, c)].append((r + 1, c))
-    elif pattern == 'random':
-        tiles = list(adj.keys())
-        for tile in tiles:
-            others = [t for t in tiles if t != tile]
-            n = random.randint(1, min(2, len(others)))
-            adj[tile] = random.sample(others, n)
+def _make_one_to_one_random(rows, cols):
+    """Each tile gets exactly 1 outgoing AND exactly 1 incoming connection.
+    Uses a random derangement — a permutation where no tile maps to itself.
+    This prevents multiple tiles piling onto the same target."""
+    tiles = [(r, c) for r in range(rows) for c in range(cols)]
+    n = len(tiles)
+    # Generate a derangement (permutation with no fixed points)
+    while True:
+        perm = list(range(n))
+        random.shuffle(perm)
+        if all(perm[i] != i for i in range(n)):
+            break
+    adj = {}
+    for i, tile in enumerate(tiles):
+        adj[tile] = [tiles[perm[i]]]
     return adj
 
+def _make_one_to_one_structured(rows, cols, direction):
+    """Each tile connects to its neighbor in the given direction.
+    Tiles on the boundary with no neighbor in that direction get no connection (orphans)."""
+    adj = {(r, c): [] for r in range(rows) for c in range(cols)}
+    dr, dc = {'right': (0, 1), 'down': (1, 0), 'left': (0, -1), 'up': (-1, 0)}[direction]
+    for r in range(rows):
+        for c in range(cols):
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < rows and 0 <= nc < cols:
+                adj[(r, c)] = [(nr, nc)]
+    return adj
+
+def _make_one_to_one_structured_full(rows, cols, direction):
+    """Like structured, but boundary tiles wrap around so every tile has exactly 1 connection."""
+    adj = {}
+    dr, dc = {'right': (0, 1), 'down': (1, 0), 'left': (0, -1), 'up': (-1, 0)}[direction]
+    for r in range(rows):
+        for c in range(cols):
+            nr, nc = (r + dr) % rows, (c + dc) % cols
+            if (nr, nc) == (r, c):
+                # Degenerate (1-wide grid in wrap direction), pick any other
+                others = [(rr, cc) for rr in range(rows) for cc in range(cols) if (rr, cc) != (r, c)]
+                adj[(r, c)] = [random.choice(others)] if others else []
+            else:
+                adj[(r, c)] = [(nr, nc)]
+    return adj
+
+def make_adjacency(rows, cols, pattern):
+    """Build adjacency dict: tile -> list of 0 or 1 targets."""
+    if pattern == 'right':
+        return _make_one_to_one_structured(rows, cols, 'right')
+    elif pattern == 'down':
+        return _make_one_to_one_structured(rows, cols, 'down')
+    elif pattern == 'right_wrap':
+        return _make_one_to_one_structured_full(rows, cols, 'right')
+    elif pattern == 'down_wrap':
+        return _make_one_to_one_structured_full(rows, cols, 'down')
+    elif pattern == 'random':
+        return _make_one_to_one_random(rows, cols)
+    else:
+        return {(r, c): [] for r in range(rows) for c in range(cols)}
+
+# ========================= LEVELS =========================
+
 LEVELS = [
-    {'rows': 3, 'cols': 3, 'pattern': 'right',      'arrows': True,  'clicks': 2},
-    {'rows': 3, 'cols': 3, 'pattern': 'down',        'arrows': True,  'clicks': 2},
-    {'rows': 3, 'cols': 3, 'pattern': 'right_down',  'arrows': True,  'clicks': 3},
-    {'rows': 4, 'cols': 4, 'pattern': 'right_down',  'arrows': True,  'clicks': 3},
-    {'rows': 4, 'cols': 4, 'pattern': 'right_down',  'arrows': False, 'clicks': 3},
-    {'rows': 4, 'cols': 4, 'pattern': 'random',      'arrows': False, 'clicks': 4},
-    {'rows': 5, 'cols': 5, 'pattern': 'random',      'arrows': False, 'clicks': 4},
+    # --- 2x2: learn the mechanic ---
+    # L1: tiny grid, right arrows shown, just click around
+    {'rows': 2, 'cols': 2, 'pattern': 'right',      'discovery': DISC_VISIBLE,  'clicks': 2},
+    # L2: down arrows, still trivial
+    {'rows': 2, 'cols': 2, 'pattern': 'down',        'discovery': DISC_VISIBLE,  'clicks': 2},
+    # L3: wrap so every tile has a connection
+    {'rows': 2, 'cols': 2, 'pattern': 'right_wrap',  'discovery': DISC_VISIBLE,  'clicks': 2},
+
+    # --- 2x3: a little more to think about ---
+    # L4: structured, visible
+    {'rows': 2, 'cols': 3, 'pattern': 'right',       'discovery': DISC_VISIBLE,  'clicks': 2},
+    # L5: wrap, visible
+    {'rows': 2, 'cols': 3, 'pattern': 'down_wrap',   'discovery': DISC_VISIBLE,  'clicks': 2},
+    # L6: introduce discover mode on a small grid
+    {'rows': 2, 'cols': 3, 'pattern': 'right_wrap',  'discovery': DISC_DISCOVER, 'clicks': 2},
+    # L7: random connections, discover mode
+    {'rows': 2, 'cols': 3, 'pattern': 'random',      'discovery': DISC_DISCOVER, 'clicks': 3},
+
+    # --- 3x3: the full game ---
+    # L8: structured, visible — ease into bigger grid
+    {'rows': 3, 'cols': 3, 'pattern': 'right_wrap',  'discovery': DISC_VISIBLE,  'clicks': 3},
+    # L9: random, discover — learn the connections
+    {'rows': 3, 'cols': 3, 'pattern': 'random',      'discovery': DISC_DISCOVER, 'clicks': 3},
+    # L10: random, discover, harder scramble
+    {'rows': 3, 'cols': 3, 'pattern': 'random',      'discovery': DISC_DISCOVER, 'clicks': 4},
+    # L11+: memory mode — pure recall
+    {'rows': 3, 'cols': 3, 'pattern': 'random',      'discovery': DISC_MEMORY,   'clicks': 3},
+    {'rows': 3, 'cols': 3, 'pattern': 'random',      'discovery': DISC_MEMORY,   'clicks': 4},
+    {'rows': 3, 'cols': 3, 'pattern': 'random',      'discovery': DISC_MEMORY,   'clicks': 5},
 ]
+
+# ========================= ARROW DRAWING HELPERS =========================
+
+def _draw_arrow_on_surface(surf, sx, sy, tx, ty, tile_size, color, alpha):
+    """Draw a single directed arrow from (sx,sy) to (tx,ty) on an SRCALPHA surface."""
+    angle = math.atan2(ty - sy, tx - sx)
+    pullback = tile_size // 2 + 2
+    ex = tx - pullback * math.cos(angle)
+    ey = ty - pullback * math.sin(angle)
+
+    pygame.draw.line(surf, (*color, alpha), (sx, sy), (int(ex), int(ey)), 2)
+
+    al = 8
+    a1x = ex - al * math.cos(angle - 0.45)
+    a1y = ey - al * math.sin(angle - 0.45)
+    a2x = ex - al * math.cos(angle + 0.45)
+    a2y = ey - al * math.sin(angle + 0.45)
+    pygame.draw.polygon(surf, (*color, alpha + 14),
+                        [(int(ex), int(ey)),
+                         (int(a1x), int(a1y)),
+                         (int(a2x), int(a2y))])
 
 # ========================= GAME =========================
 
 class Game:
-    def __init__(self):
-        self.screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
-        pygame.display.set_caption("The Flippening")
-        self.clock = pygame.time.Clock()
+    def __init__(self, screen=None, clock=None, fonts=None):
+        if screen is None:
+            self.screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
+            pygame.display.set_caption("The Flippening")
+        else:
+            self.screen = screen
 
-        # Fonts — try nice system fonts, fall back to default
-        for name in ('Helvetica Neue', 'Helvetica', 'Arial', None):
-            try:
-                self.font_lg = pygame.font.SysFont(name, 30)
-                self.font_md = pygame.font.SysFont(name, 20)
-                self.font_sm = pygame.font.SysFont(name, 15)
-                break
-            except Exception:
-                continue
+        self.clock = clock or pygame.time.Clock()
+
+        if fonts:
+            self.font_lg, self.font_md, self.font_sm = fonts
+        else:
+            for name in ('Helvetica Neue', 'Helvetica', 'Arial', None):
+                try:
+                    self.font_lg = pygame.font.SysFont(name, 30)
+                    self.font_md = pygame.font.SysFont(name, 20)
+                    self.font_sm = pygame.font.SysFont(name, 15)
+                    break
+                except Exception:
+                    continue
 
         self.level_idx = 0
         self.tiles = {}
         self.adj = {}
         self.rows = self.cols = 0
-        self.show_arrows = True
+        self.discovery = DISC_VISIBLE
         self.tile_size = 0
         self.grid_x = self.grid_y = 0
         self.solved = False
         self.solve_time = 0.0
         self.moves = 0
         self.btn_rect = pygame.Rect(0, 0, 0, 0)
-        self.flashes = []          # (src, dst, t0)
-        self.arrow_surf = None     # cached arrow overlay
+        self.flashes = []              # (src, dst, t0)
+        self.arrow_surf = None         # cached static arrow overlay (visible mode)
+        self.discovered = set()        # set of (src, dst) pairs revealed in discover mode
+        self.discovered_surf = None    # rebuilt when discovered set changes
         self.hovered_tile = None
+
+        # Back button
+        self.back_rect = pygame.Rect(20, WINDOW_H - 58, 90, 36)
 
         self.load_level(0)
 
@@ -266,10 +363,10 @@ class Game:
         self.level_idx = idx
         defn = LEVELS[min(idx, len(LEVELS) - 1)]
         self.rows, self.cols = defn['rows'], defn['cols']
-        self.show_arrows = defn['arrows']
+        self.discovery = defn['discovery']
         self.adj = make_adjacency(self.rows, self.cols, defn['pattern'])
 
-        # Tile sizing — fit comfortably with breathing room
+        # Tile sizing
         max_w = WINDOW_W - 80
         max_h = WINDOW_H - 260
         tw = (max_w - (self.cols - 1) * TILE_GAP) // self.cols
@@ -281,7 +378,6 @@ class Game:
         self.grid_x = (WINDOW_W - total_w) // 2
         self.grid_y = 130 + (max_h - total_h) // 2
 
-        # Create tiles
         self.tiles = {}
         for r in range(self.rows):
             for c in range(self.cols):
@@ -299,9 +395,10 @@ class Game:
         self.moves = 0
         self.flashes = []
         self.hovered_tile = None
+        self.discovered = set()
+        self.discovered_surf = None
         self._build_arrow_surface()
 
-        # Button
         bw, bh = 150, 42
         self.btn_rect = pygame.Rect((WINDOW_W - bw) // 2, WINDOW_H - 72, bw, bh)
 
@@ -318,7 +415,6 @@ class Game:
                 self.tiles[pos].flip_silent()
                 for nb in self.adj.get(pos, []):
                     self.tiles[nb].flip_silent()
-        # Ensure not already solved
         if self._check_solved():
             pos = random.choice(positions)
             self.tiles[pos].flip_silent()
@@ -329,39 +425,35 @@ class Game:
         vals = set(t.color for t in self.tiles.values())
         return len(vals) == 1
 
-    # ----- arrow pre-render -----
+    # ----- arrow surfaces -----
 
     def _build_arrow_surface(self):
-        if not self.show_arrows:
+        """Pre-render static arrows for visible mode."""
+        if self.discovery != DISC_VISIBLE:
             self.arrow_surf = None
             return
         self.arrow_surf = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
         half = self.tile_size // 2
-        pullback = half + 2
-
         for src, targets in self.adj.items():
             sx = self.tiles[src].x + half
             sy = self.tiles[src].y + half
             for dst in targets:
                 tx = self.tiles[dst].x + half
                 ty = self.tiles[dst].y + half
-                angle = math.atan2(ty - sy, tx - sx)
-                ex = tx - pullback * math.cos(angle)
-                ey = ty - pullback * math.sin(angle)
+                _draw_arrow_on_surface(self.arrow_surf, sx, sy, tx, ty,
+                                       self.tile_size, (255, 255, 255), ARROW_STATIC_ALPHA)
 
-                # Line
-                pygame.draw.line(self.arrow_surf, (255, 255, 255, ARROW_ALPHA),
-                                 (sx, sy), (int(ex), int(ey)), 2)
-                # Arrowhead
-                al = 8
-                a1x = ex - al * math.cos(angle - 0.45)
-                a1y = ey - al * math.sin(angle - 0.45)
-                a2x = ex - al * math.cos(angle + 0.45)
-                a2y = ey - al * math.sin(angle + 0.45)
-                pygame.draw.polygon(self.arrow_surf, (255, 255, 255, ARROW_ALPHA + 14),
-                                    [(int(ex), int(ey)),
-                                     (int(a1x), int(a1y)),
-                                     (int(a2x), int(a2y))])
+    def _rebuild_discovered_surface(self):
+        """Rebuild the overlay showing discovered connections."""
+        self.discovered_surf = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+        half = self.tile_size // 2
+        for src, dst in self.discovered:
+            sx = self.tiles[src].x + half
+            sy = self.tiles[src].y + half
+            tx = self.tiles[dst].x + half
+            ty = self.tiles[dst].y + half
+            _draw_arrow_on_surface(self.discovered_surf, sx, sy, tx, ty,
+                                   self.tile_size, ARROW_DISCOVERED_COLOR, ARROW_DISCOVERED_ALPHA)
 
     # ----- input -----
 
@@ -377,10 +469,20 @@ class Game:
         now = time.time()
         self.moves += 1
         self.tiles[pos].flip(now)
-        for i, nb in enumerate(self.adj.get(pos, [])):
+
+        neighbors = self.adj.get(pos, [])
+        for i, nb in enumerate(neighbors):
             delay = (i + 1) * NEIGHBOR_STAGGER
             self.tiles[nb].flip(now, delay)
             self.flashes.append((pos, nb, now + delay * 0.4))
+
+            # Discover mode: permanently reveal this connection
+            if self.discovery == DISC_DISCOVER:
+                edge = (pos, nb)
+                if edge not in self.discovered:
+                    self.discovered.add(edge)
+                    self._rebuild_discovered_surface()
+
         if self._check_solved():
             self.solved = True
             self.solve_time = now
@@ -435,6 +537,14 @@ class Game:
         mt = self.font_sm.render(f"moves  {self.moves}", True, TEXT_DIM)
         self.screen.blit(mt, ((WINDOW_W - mt.get_width()) // 2, 58))
 
+        # Discovery mode hint
+        if self.discovery == DISC_DISCOVER:
+            hint = self.font_sm.render("click to reveal connections", True, TEXT_DIM)
+            self.screen.blit(hint, ((WINDOW_W - hint.get_width()) // 2, 78))
+        elif self.discovery == DISC_MEMORY:
+            hint = self.font_sm.render("watch carefully", True, TEXT_DIM)
+            self.screen.blit(hint, ((WINDOW_W - hint.get_width()) // 2, 78))
+
         # Win text
         if self.solved:
             elapsed = now - self.solve_time
@@ -463,19 +573,29 @@ class Game:
         self.screen.blit(bt, (self.btn_rect.centerx - bt.get_width() // 2,
                                self.btn_rect.centery - bt.get_height() // 2))
 
+        # Back button
+        hov = self.back_rect.collidepoint(mx, my)
+        bc = BUTTON_HOVER if hov else BUTTON_IDLE
+        pygame.draw.rect(self.screen, bc, self.back_rect, border_radius=8)
+        bk = self.font_sm.render("back", True, TEXT_COLOR)
+        self.screen.blit(bk, (self.back_rect.centerx - bk.get_width() // 2,
+                               self.back_rect.centery - bk.get_height() // 2))
+
     # ----- main loop -----
 
     def run(self):
+        """Returns True if user clicks back (to menu), False if quit."""
         while True:
             now = time.time()
 
             for ev in pygame.event.get():
                 if ev.type == pygame.QUIT:
-                    pygame.quit()
-                    sys.exit()
+                    return False
 
                 if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
                     mx, my = ev.pos
+                    if self.back_rect.collidepoint(mx, my):
+                        return True
                     if self.btn_rect.collidepoint(mx, my):
                         if self.solved:
                             self.load_level(self.level_idx + 1)
@@ -492,8 +612,11 @@ class Game:
             # Render
             self.screen.blit(get_bg_surface(), (0, 0))
 
+            # Arrows: static (visible mode) or discovered overlay
             if self.arrow_surf:
                 self.screen.blit(self.arrow_surf, (0, 0))
+            if self.discovered_surf:
+                self.screen.blit(self.discovered_surf, (0, 0))
 
             self._draw_flashes(now)
             self._draw_hover(now)
@@ -506,8 +629,108 @@ class Game:
             pygame.display.flip()
             self.clock.tick(FPS)
 
+# ========================= MODE SELECT =========================
+
+class ModeSelect:
+    def __init__(self, screen, clock, fonts):
+        self.screen = screen
+        self.clock = clock
+        self.font_lg, self.font_md, self.font_sm = fonts
+
+        bw, bh = 200, 50
+        cx = WINDOW_W // 2
+        self.campaign_btn = pygame.Rect(cx - bw // 2, 320, bw, bh)
+        self.endless_btn = pygame.Rect(cx - bw // 2, 400, bw, bh)
+
+    def run(self):
+        """Returns 'campaign', 'endless', or None (quit)."""
+        while True:
+            now = time.time()
+            for ev in pygame.event.get():
+                if ev.type == pygame.QUIT:
+                    return None
+                if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                    mx, my = ev.pos
+                    if self.campaign_btn.collidepoint(mx, my):
+                        return 'campaign'
+                    if self.endless_btn.collidepoint(mx, my):
+                        return 'endless'
+
+            self.screen.blit(get_bg_surface(), (0, 0))
+
+            # Title
+            title = self.font_lg.render("the flippening", True, TEXT_COLOR)
+            self.screen.blit(title, ((WINDOW_W - title.get_width()) // 2, 180))
+
+            # Subtitle
+            sub = self.font_sm.render("a directional flip puzzle", True, TEXT_DIM)
+            self.screen.blit(sub, ((WINDOW_W - sub.get_width()) // 2, 225))
+
+            mx, my = pygame.mouse.get_pos()
+
+            # Campaign button
+            hov = self.campaign_btn.collidepoint(mx, my)
+            bc = BUTTON_HOVER if hov else BUTTON_IDLE
+            pygame.draw.rect(self.screen, bc, self.campaign_btn, border_radius=12)
+            bt = self.font_md.render("campaign", True, TEXT_COLOR)
+            self.screen.blit(bt, (self.campaign_btn.centerx - bt.get_width() // 2,
+                                   self.campaign_btn.centery - bt.get_height() // 2))
+
+            # Endless button
+            hov = self.endless_btn.collidepoint(mx, my)
+            bc = BUTTON_HOVER if hov else BUTTON_IDLE
+            pygame.draw.rect(self.screen, bc, self.endless_btn, border_radius=12)
+            bt = self.font_md.render("endless", True, TEXT_COLOR)
+            self.screen.blit(bt, (self.endless_btn.centerx - bt.get_width() // 2,
+                                   self.endless_btn.centery - bt.get_height() // 2))
+
+            # Hint
+            hint = self.font_sm.render("click to begin", True, TEXT_DIM)
+            p = (math.sin(now * 2.0) + 1.0) * 0.5
+            hint.set_alpha(int(120 + 80 * p))
+            self.screen.blit(hint, ((WINDOW_W - hint.get_width()) // 2, 490))
+
+            pygame.display.flip()
+            self.clock.tick(FPS)
+
 # ========================= ENTRY =========================
 
+def main():
+    screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
+    pygame.display.set_caption("The Flippening")
+    clock = pygame.time.Clock()
+
+    for name in ('Helvetica Neue', 'Helvetica', 'Arial', None):
+        try:
+            font_lg = pygame.font.SysFont(name, 30)
+            font_md = pygame.font.SysFont(name, 20)
+            font_sm = pygame.font.SysFont(name, 15)
+            break
+        except Exception:
+            continue
+
+    fonts = (font_lg, font_md, font_sm)
+
+    while True:
+        menu = ModeSelect(screen, clock, fonts)
+        choice = menu.run()
+
+        if choice is None:
+            break
+        elif choice == 'campaign':
+            game = Game(screen, clock, fonts)
+            back = game.run()
+            if not back:
+                break
+        elif choice == 'endless':
+            from endless import EndlessGame
+            eg = EndlessGame(screen, clock, fonts)
+            back = eg.run()
+            if not back:
+                break
+
+    pygame.quit()
+    sys.exit()
+
 if __name__ == "__main__":
-    game = Game()
-    game.run()
+    main()
