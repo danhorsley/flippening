@@ -27,7 +27,7 @@ HEX_RADIUS = 30          # outer radius of each hexagon
 HEX_GAP = 4              # gap between hexes
 GRID_RINGS = 3            # hex rings around center (0 = just center)
                           # rings=3 gives 37 hexes
-CLUSTER_MIN = 5           # adjacent same-color hexes needed to clear
+CLUSTER_MIN = 7           # adjacent same-color hexes needed to clear
 MAX_EDGE_DIST = 2         # max hex distance for a connection
 ARROW_ALPHA = 36          # arrows always visible in endless
 
@@ -143,10 +143,10 @@ class HexTile:
         self.clearing = True
         self.clear_t0 = now + delay
 
-    def respawn(self, now, delay=0.0):
+    def respawn(self, now, color=None, delay=0.0):
         self.clearing = False
         self.clear_t0 = -1.0
-        self.color = random.randint(0, NUM_COLORS - 1)
+        self.color = color if color is not None else random.randint(0, NUM_COLORS - 1)
         self.prev_color = self.color
         self.spawning = True
         self.spawn_t0 = now + delay
@@ -380,14 +380,14 @@ class EndlessGame:
         self.adj = build_local_connections(self.coords, MAX_EDGE_DIST)
         self._build_arrow_surface()
 
-        # Clear any starting clusters so board begins messy
-        for _ in range(10):
+        # Break up any starting clusters
+        for _ in range(20):
             clusters = find_clusters(self.tiles, self.coords)
             if not clusters:
                 break
             for cluster in clusters:
                 for c in cluster:
-                    self.tiles[c].color = random.randint(0, NUM_COLORS - 1)
+                    self.tiles[c].color = self._safe_color(c)
                     self.tiles[c].prev_color = self.tiles[c].color
 
     def _build_arrow_surface(self):
@@ -450,12 +450,28 @@ class EndlessGame:
         respawn_time = now + delay_base + len(all_clearing) * 0.025 + CLEAR_SHRINK_DUR + 0.1
         self.pending_respawns.append((list(all_clearing), respawn_time))
 
+    def _safe_color(self, coord):
+        """Pick a color that won't create a large same-color blob around coord.
+        Count how many spatial neighbors already have each color; pick the least common."""
+        coord_set = set(self.coords)
+        counts = [0] * NUM_COLORS
+        for nb in hex_neighbors(coord[0], coord[1]):
+            if nb in coord_set and nb in self.tiles:
+                t = self.tiles[nb]
+                if not t.clearing and not t.spawning:
+                    counts[t.color] += 1
+        # Pick from colors with the fewest adjacent matches
+        min_count = min(counts)
+        options = [c for c, cnt in enumerate(counts) if cnt == min_count]
+        return random.choice(options)
+
     def _process_respawns(self, now):
         still_pending = []
         for coords_list, resp_time in self.pending_respawns:
             if now >= resp_time:
                 for i, c in enumerate(coords_list):
-                    self.tiles[c].respawn(now, i * 0.03)
+                    safe = self._safe_color(c)
+                    self.tiles[c].respawn(now, color=safe, delay=i * 0.03)
                 # After respawning, schedule another cluster check
                 check_time = now + len(coords_list) * 0.03 + SPAWN_GROW_DUR + 0.1
                 self.pending_clears.append(check_time)
